@@ -57,7 +57,7 @@ from src.auth_helpers import (
 )
 from routes.session_routes import _verify_session_owner
 from routes.document_helpers import _owner_session_filter
-from core.database import SessionLocal, get_session_mode, set_session_mode
+from core.database import SessionLocal, get_session_mode, set_session_mode, utcnow_naive
 from core.database import Session as DBSession, ChatMessage as DBChatMessage
 from core.database import Document as DBDocument, ModelEndpoint
 from core.log_safety import redact_url
@@ -134,6 +134,17 @@ def _clean_v3_route_for_model(
     if mode:
         return mode in {"compact", "odysseus_compact"}
     return tool_schema_profile(model) == ODYSSEUS_COMPACT_TOOL_SCHEMA_PROFILE
+
+
+def _full_trust_mode() -> bool:
+    """Single-user/local trust mode (ODYSSEUS_FULL_TRUST=1).
+
+    Skips intent-based grant narrowing and the compact turn contract so the
+    model sees the complete enabled tool inventory every turn. Explicit user
+    toggles, disabled tools, the approval gate and workspace launch scoping
+    still apply at execution.
+    """
+    return os.getenv("ODYSSEUS_FULL_TRUST", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _turn_contract_enabled(*, exact_tool_approval, runtime_surface,
@@ -2905,6 +2916,19 @@ def setup_chat_routes(
                     _workspace_agent_intent = True
                     allow_bash = "true"
                     logger.info("chat→agent auto-escalation: explicit path workspace=%s", workspace)
+                    # Persist so follow-up turns keep the workspace even when
+                    # their message names no path (same store the session
+                    # settings endpoint writes).
+                    db = SessionLocal()
+                    try:
+                        db_session = db.query(DBSession).filter(DBSession.id == sess.id).first()
+                        if db_session:
+                            db_session.cwd = workspace
+                            db_session.updated_at = utcnow_naive()
+                            db.commit()
+                        sess.cwd = workspace
+                    finally:
+                        db.close()
         except SessionNotFoundError as e:
             raise HTTPException(404, str(e))
         except (ValueError, ValidationError):
@@ -3174,12 +3198,15 @@ def setup_chat_routes(
                 )
             )
         )
-        _use_turn_contract = _turn_contract_enabled(
-            exact_tool_approval=exact_tool_approval,
-            runtime_surface=_runtime_surface,
-            native_workspace_contract=_native_workspace_contract,
-            clean_v3_route=_clean_v3_route_requested,
-            full_schema_route=(_effective_tool_schema_mode == "full"),
+        _use_turn_contract = (
+            _turn_contract_enabled(
+                exact_tool_approval=exact_tool_approval,
+                runtime_surface=_runtime_surface,
+                native_workspace_contract=_native_workspace_contract,
+                clean_v3_route=_clean_v3_route_requested,
+                full_schema_route=(_effective_tool_schema_mode == "full"),
+            )
+            and not _full_trust_mode()
         )
         _turn_history = getattr(sess, "history", []) or []
         from src.turn_contract import corrected_browser_target
@@ -3413,7 +3440,7 @@ def setup_chat_routes(
         # the heavy "do things on the computer" tools — otherwise the model
         # tries to shell out for a request that never needed it, then fails
         # (and looks broken when the shell is disabled).
-        if auto_escalated and not _workspace_agent_intent and not _use_turn_contract:
+        if auto_escalated and not _workspace_agent_intent and not _use_turn_contract and not _full_trust_mode():
             disabled_tools.update({
                 "bash", "python", "read_file", "write_file",
             })
@@ -3478,6 +3505,11 @@ def setup_chat_routes(
         }
         # Capture permission state before schema selection/reconciliation.
         # Only deterministic request intent supplies grants, never inventory.
+        # Single-user/local trust mode: skip intent-based grant narrowing and
+        # the compact turn contract so the model sees the complete enabled
+        # tool inventory every turn. Explicit toggles, disabled tools, the
+        # approval gate and workspace launch scoping still apply.
+        _full_trust = _full_trust_mode()
         _request_authority = request_authority_for_http(
             request, message, owner=_user, session_id=session, workspace=workspace,
             history=_turn_history, policy=tool_policy,
@@ -3488,6 +3520,7 @@ def setup_chat_routes(
             capabilities=({'search_browser'} if (
                 _explicit_browser_intent or _external_discovery_intent
             ) else ()),
+            grant_all_tools=_full_trust,
         )
         if exact_tool_approval is not None:
             from src.agent_runtime.authority import RequestAuthority
@@ -3495,6 +3528,29 @@ def setup_chat_routes(
                 exact_tool_approval.pending.request_authority
                 or RequestAuthority.empty(owner=_user, session_id=session, workspace=workspace)
             ).restrict(tool_policy)
+        elif (
+            workspace and isinstance(message, str)
+            and _LOCAL_FILE_TASK_RE.search(message)
+        ):
+            # A bound workspace plus a filesystem/shell request is an
+            # execution work order. The compact intent classifier can
+            # misroute it to management/serve tools, which would leave bash
+            # unpermitted ("outside server request authority") even though
+            # the turn contract correctly offers it. Widen deterministically
+            # with the shell family; tool policy and disabled tools still
+            # apply at execution.
+            from dataclasses import replace as _dc_replace
+            from src.agent_runtime.authority import OperationGrant
+            _have = {g.tool for g in _request_authority.grants}
+            _add = tuple(
+                OperationGrant(t) for t in sorted(FAMILY_TOOLS["shell_files"])
+                if t not in _have
+            )
+            if _add:
+                _request_authority = _dc_replace(
+                    _request_authority,
+                    grants=tuple(_request_authority.grants) + _add,
+                )
         _turn_contract = None
         # Image models execute directly, not through the text-agent inventory.
         # Keep the permission policy above, but do not apply routing omissions
@@ -3621,7 +3677,11 @@ def setup_chat_routes(
                 policy=_contract_policy, required_tools=_required_tools,
                 required_capabilities=_active_turn_capabilities,
                 selected_tools=_selected_tools,
-                always_available_tools=(FAMILY_TOOLS["documents"] if active_doc else ()),
+                always_available_tools=(
+                    FAMILY_TOOLS["documents"] if active_doc
+                    else FAMILY_TOOLS["shell_files"] if _workspace_agent_intent
+                    else ()
+                ),
                 warm_tools=_warm_tools,
                 message=message, history=getattr(sess, "history", []) or [],
             )

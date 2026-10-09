@@ -363,13 +363,23 @@ def interpret_request(request_text, *, history=(), workspace=None, active_docume
 
 def create_request_authority(request_text, *, owner=None, session_id=None, workspace=None,
                              history=(), policy=None, active_document=False,
-                             image_attachment=False, capabilities=None, client_runtime_context=None):
-    """Deterministic server policy over semantic facts, never schema inventory."""
+                             image_attachment=False, capabilities=None, client_runtime_context=None,
+                             grant_all_tools=False):
+    """Deterministic server policy over semantic facts, never schema inventory.
+
+    ``grant_all_tools`` opts a deployment out of intent-based grant narrowing
+    (single-user/local trust mode): every tool family is granted regardless of
+    what the request classifier selected. Explicit policy, disabled tools and
+    the approval gate still apply at execution.
+    """
     if not isinstance(request_text, str):
         raise TypeError("Authority requires trusted request text")
     intent = interpret_request(request_text, history=history, active_document=active_document,
                                workspace=workspace, image_attachment=image_attachment)
     families = intent.capabilities
+    if grant_all_tools:
+        families = frozenset(FAMILY_TOOLS) | families
+        intent = replace(intent, selected_tools=None)
     if capabilities is not None:
         families |= frozenset(capabilities)
     tools = set().union(*(FAMILY_TOOLS.get(f, ()) for f in families))
