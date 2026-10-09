@@ -57,7 +57,7 @@ from src.auth_helpers import (
 )
 from routes.session_routes import _verify_session_owner
 from routes.document_helpers import _owner_session_filter
-from core.database import SessionLocal, get_session_mode, set_session_mode
+from core.database import SessionLocal, get_session_mode, set_session_mode, utcnow_naive
 from core.database import Session as DBSession, ChatMessage as DBChatMessage
 from core.database import Document as DBDocument, ModelEndpoint
 from core.log_safety import redact_url
@@ -2905,6 +2905,19 @@ def setup_chat_routes(
                     _workspace_agent_intent = True
                     allow_bash = "true"
                     logger.info("chat→agent auto-escalation: explicit path workspace=%s", workspace)
+                    # Persist so follow-up turns keep the workspace even when
+                    # their message names no path (same store the session
+                    # settings endpoint writes).
+                    db = SessionLocal()
+                    try:
+                        db_session = db.query(DBSession).filter(DBSession.id == sess.id).first()
+                        if db_session:
+                            db_session.cwd = workspace
+                            db_session.updated_at = utcnow_naive()
+                            db.commit()
+                        sess.cwd = workspace
+                    finally:
+                        db.close()
         except SessionNotFoundError as e:
             raise HTTPException(404, str(e))
         except (ValueError, ValidationError):
@@ -3495,6 +3508,29 @@ def setup_chat_routes(
                 exact_tool_approval.pending.request_authority
                 or RequestAuthority.empty(owner=_user, session_id=session, workspace=workspace)
             ).restrict(tool_policy)
+        elif (
+            workspace and isinstance(message, str)
+            and _LOCAL_FILE_TASK_RE.search(message)
+        ):
+            # A bound workspace plus a filesystem/shell request is an
+            # execution work order. The compact intent classifier can
+            # misroute it to management/serve tools, which would leave bash
+            # unpermitted ("outside server request authority") even though
+            # the turn contract correctly offers it. Widen deterministically
+            # with the shell family; tool policy and disabled tools still
+            # apply at execution.
+            from dataclasses import replace as _dc_replace
+            from src.agent_runtime.authority import OperationGrant
+            _have = {g.tool for g in _request_authority.grants}
+            _add = tuple(
+                OperationGrant(t) for t in sorted(FAMILY_TOOLS["shell_files"])
+                if t not in _have
+            )
+            if _add:
+                _request_authority = _dc_replace(
+                    _request_authority,
+                    grants=tuple(_request_authority.grants) + _add,
+                )
         _turn_contract = None
         # Image models execute directly, not through the text-agent inventory.
         # Keep the permission policy above, but do not apply routing omissions
@@ -3621,7 +3657,11 @@ def setup_chat_routes(
                 policy=_contract_policy, required_tools=_required_tools,
                 required_capabilities=_active_turn_capabilities,
                 selected_tools=_selected_tools,
-                always_available_tools=(FAMILY_TOOLS["documents"] if active_doc else ()),
+                always_available_tools=(
+                    FAMILY_TOOLS["documents"] if active_doc
+                    else FAMILY_TOOLS["shell_files"] if _workspace_agent_intent
+                    else ()
+                ),
                 warm_tools=_warm_tools,
                 message=message, history=getattr(sess, "history", []) or [],
             )
