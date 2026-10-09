@@ -799,6 +799,16 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
         return {"error": "Invalid JSON arguments", "exit_code": 1}
 
     action = (args.get("action") or "call").lower()
+    if action not in ("call", "endpoints"):
+        return {
+            "error": (
+                f"Unknown app_api action {action!r}. Valid actions are "
+                "'call' (with path/method/body/query) and 'endpoints'. "
+                "There is no API behind that action name — call with "
+                "action='endpoints' and a filter to list what exists."
+            ),
+            "exit_code": 1,
+        }
     base = _INTERNAL_BASE
 
     if action == "endpoints":
