@@ -33375,47 +33375,62 @@ async def stream_agent_loop(
                     )
                     approval_selected_tools.add(block.tool_type)
                     approval_selected_tools.difference_update(disabled_tools)
-                    pending_approval = tool_approval_store.create(
-                        owner=owner,
-                        session_id=session_id,
-                        origin_run_id=run_security.run_id,
-                        tool_name=block.tool_type,
-                        content=block.content,
-                        workspace=workspace,
-                        document_id=getattr(approval_document, "id", None),
-                        document_version=getattr(approval_document, "version_count", None),
-                        document_digest=(
-                            document_content_digest(
-                                getattr(approval_document, "current_content", "")
-                            )
-                            if approval_document is not None
-                            else None
-                        ),
-                        external_untrusted_context_seen=(
-                            run_security.external_untrusted_context_seen
-                        ),
-                        selected_tools=approval_selected_tools,
-                        continuation_query=_retrieval_query or _last_user,
-                        capabilities=capabilities_for_action(
-                            block.tool_type, block.content
-                        ),
-                        request_text=_last_user,
-                        request_authority=active_request_authority(),
-                        client_runtime_context=client_runtime_context,
-                    )
-                    desc = f"{block.tool_type}: APPROVAL REQUIRED"
-                    result = {
-                        "output": "Waiting for an exact user approval.",
-                        "exit_code": None,
-                        "approval_required": True,
-                        "ask_user": pending_approval.public_payload(
-                            reason=security_decision.reason,
-                        ),
-                    }
-                    logger.info(
-                        "Exact approval required before tool start: %s",
-                        block.tool_type,
-                    )
+                    try:
+                        pending_approval = tool_approval_store.create(
+                            owner=owner,
+                            session_id=session_id,
+                            origin_run_id=run_security.run_id,
+                            tool_name=block.tool_type,
+                            content=block.content,
+                            workspace=workspace,
+                            document_id=getattr(approval_document, "id", None),
+                            document_version=getattr(approval_document, "version_count", None),
+                            document_digest=(
+                                document_content_digest(
+                                    getattr(approval_document, "current_content", "")
+                                )
+                                if approval_document is not None
+                                else None
+                            ),
+                            external_untrusted_context_seen=(
+                                run_security.external_untrusted_context_seen
+                            ),
+                            selected_tools=approval_selected_tools,
+                            continuation_query=_retrieval_query or _last_user,
+                            capabilities=capabilities_for_action(
+                                block.tool_type, block.content
+                            ),
+                            request_text=_last_user,
+                            request_authority=active_request_authority(),
+                            client_runtime_context=client_runtime_context,
+                        )
+                    except ValueError as approval_seal_error:
+                        desc = f"{block.tool_type}: BLOCKED"
+                        result = {
+                            "error": str(approval_seal_error),
+                            "exit_code": 1,
+                            "blocked": True,
+                            "policy": "exact_tool_approval_unsealable",
+                        }
+                        logger.info(
+                            "Exact approval proposal for %s cannot be sealed: %s",
+                            block.tool_type,
+                            approval_seal_error,
+                        )
+                    else:
+                        desc = f"{block.tool_type}: APPROVAL REQUIRED"
+                        result = {
+                            "output": "Waiting for an exact user approval.",
+                            "exit_code": None,
+                            "approval_required": True,
+                            "ask_user": pending_approval.public_payload(
+                                reason=security_decision.reason,
+                            ),
+                        }
+                        logger.info(
+                            "Exact approval required before tool start: %s",
+                            block.tool_type,
+                        )
             else:
                 _execution_attempted = True
                 if block.tool_type in {"bash", "host_shell", "python"}:

@@ -281,14 +281,16 @@ async def test_exact_approval_grants_one_input_without_widening_continuation(mon
     assert "request_authority" not in pending.public_payload()
 
 
-def test_approval_digest_binds_authority_snapshot():
+def test_approval_digest_binds_authority_snapshot(tmp_path):
     from src.tool_approvals import ExactToolApproval, ToolApprovalStore
     from src.tool_capabilities import capabilities_for_action
     pending = ToolApprovalStore().create(owner="alice", session_id="s", origin_run_id="journal",
-        tool_name="bash", content="pwd", workspace=None, external_untrusted_context_seen=True,
-        capabilities=capabilities_for_action("bash", "pwd"), request_authority=authority("transcribe_media"))
-    forged = ExactToolApproval(replace(pending, request_authority=authority("bash", "python")))
-    assert not forged.matches(owner="alice", session_id="s", workspace=None, tool_name="bash", content="pwd")
+        tool_name="bash", content="pwd", workspace=str(tmp_path), external_untrusted_context_seen=True,
+        capabilities=capabilities_for_action("bash", "pwd"),
+        request_authority=authority("bash", workspace=str(tmp_path)))
+    forged = ExactToolApproval(replace(pending, request_authority=authority("bash", "python",
+        workspace=str(tmp_path))))
+    assert not forged.matches(owner="alice", session_id="s", workspace=str(tmp_path), tool_name="bash", content="pwd")
 
 
 @pytest.mark.asyncio

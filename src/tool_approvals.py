@@ -26,6 +26,7 @@ from src.tool_approval_scopes import (
 )
 from src.tool_capabilities import ToolCapabilities, capabilities_for_action
 from src.agent_runtime.authority import RequestAuthority
+from src.agent_runtime.process_resources import JOB_TOOL, LAUNCH_TOOLS
 
 if TYPE_CHECKING:
     from src.agent_runtime.resource_binding import BoundFilesystemOperation
@@ -437,6 +438,17 @@ class ToolApprovalStore:
                     document_digest = owned_operation.document_digest
         except (ValueError, TypeError, OSError, RuntimeError, AttributeError):
             pass  # Unresolved proposals are never reconstructed at execution.
+        if (request_authority is not None and process_operation is None
+                and tool_name in LAUNCH_TOOLS | {JOB_TOOL}):
+            # A process approval without a sealed launch/job identity could
+            # never execute after the user approves it; refusing the card
+            # here surfaces the cause instead of a dead approval prompt.
+            raise ValueError(
+                "The proposed shell/job action cannot be approved: this "
+                "session has no bound workspace launch scope, so the "
+                "approved action could never execute. Bind a workspace "
+                "(name an explicit path in the request) and retry."
+            )
         if tool_name in NATIVE_FILESYSTEM_TOOLS and backend_operation is not None and isinstance(backend_operation.resource, NativeBackendResource):
             try:
                 roots = request_authority.resource_roots if request_authority is not None else ()

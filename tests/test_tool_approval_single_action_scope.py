@@ -58,6 +58,55 @@ def test_single_action_grant_leaves_the_gate_armed_behind_the_sealed_action():
     assert resumed.decision_for("bash").allowed is False
 
 
+def _authority_for(workspace):
+    from src.agent_runtime.authority import create_request_authority
+    return create_request_authority(
+        "copy all photos from today from phone to tux Downloads folder",
+        owner="alice", session_id="s1", workspace=workspace)
+
+
+def test_launch_tool_approval_without_sealable_scope_is_refused():
+    """A bash approval that could never execute must not offer a dead card."""
+    from src.agent_runtime.authority import bind_request_authority
+    store = ToolApprovalStore()
+    content = "printf exact"
+    authority = _authority_for("")
+    with bind_request_authority(authority):
+        with pytest.raises(ValueError, match="launch scope"):
+            store.create(
+                owner="Alice",
+                session_id="s1",
+                origin_run_id="run-1",
+                tool_name="bash",
+                content=content,
+                workspace="",
+                external_untrusted_context_seen=True,
+                capabilities=capabilities_for_action("bash", content),
+                request_authority=authority,
+            )
+
+
+def test_launch_tool_approval_with_workspace_seals_process_identity(tmp_path):
+    from src.agent_runtime.authority import bind_request_authority
+    store = ToolApprovalStore()
+    content = "printf exact"
+    authority = _authority_for(str(tmp_path))
+    with bind_request_authority(authority):
+        pending = store.create(
+            owner="Alice",
+            session_id="s1",
+            origin_run_id="run-1",
+            tool_name="bash",
+            content=content,
+            workspace=str(tmp_path),
+            external_untrusted_context_seen=True,
+            capabilities=capabilities_for_action("bash", content),
+            request_authority=authority,
+        )
+    assert pending.process_operation is not None
+    assert pending.process_operation.launch is not None
+
+
 def test_chat_callers_still_get_the_continuation_scope_they_asked_for():
     store = ToolApprovalStore()
     pending = _pending(store, session_id="session-1")
